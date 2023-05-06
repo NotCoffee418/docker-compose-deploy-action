@@ -1,0 +1,46 @@
+name: 'Custom Deploy Action'
+description: 'Deploy a repository using Docker Compose on a remote server through SSH'
+inputs:
+  ssh_host:
+    description: 'Host IP or domain name'
+    required: true
+  ssh_user:
+    description: 'SSH username'
+    required: true
+  ssh_key:
+    description: 'SSH private key'
+    required: false
+  ssh_password:
+    description: 'SSH password'
+    required: false
+  ssh_deployer_path:
+    description: 'Path to the deployer directory on the remote server where the repository will be placed'
+    required: true
+  repository:
+    description: 'GitHub repository to deploy (e.g., username/repo)'
+    required: true    
+  branch:
+    description: 'Git branch to checkout (optional, defaults to "main")'
+    required: false
+    default: 'main'
+  docker_compose_file:
+    description: 'Docker Compose file (optional, defaults to docker-compose.yml)'
+    required: false
+    default: 'docker-compose.yml'
+runs:
+  using: 'composite'
+  steps:
+    - name: Deploy
+      uses: fifsky/ssh-action@v0.0.6
+      with:
+        host: ${{ inputs.ssh_host }}
+        user: ${{ inputs.ssh_user }}
+        key: ${{ inputs.key }}
+        password: ${{ inputs.ssh_password }}
+        command: |
+          cd ${{ inputs.ssh_deployer_path }}
+          docker compose -f ${{ inputs.docker_compose_file }} down
+          GIT_SSH_COMMAND='ssh' git clone git@github.com:${{ inputs.repository }}.git . \
+            2> /dev/null || GIT_SSH_COMMAND='ssh' git -C . pull
+          git checkout ${{ inputs.branch }}
+          docker compose -f ${{ inputs.docker_compose_file }} up --build --force-recreate -d

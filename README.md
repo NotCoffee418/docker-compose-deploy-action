@@ -1,31 +1,55 @@
-# docker-compose-deploy-action
-Action to deploy a docker-compose file from from GitHub.
 
-### Example
+# Docker Compose Deploy Action
+
+This GitHub Action deploys a repository using Docker Compose on a remote server through SSH.
+
+## Usage
+
+To use this action, add the following YAML code to your GitHub Actions workflow:
+
 ```yaml
-name: Deploy
-
+name: Deploy My App
 on:
   push:
-    branches: [main]
-
+    branches:
+      - main
 jobs:
-  build:
-    runs-on: ubuntu-20.04
-
+  deploy:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-
-      # ... your other steps ...
-
-      - name: Deploy
-        uses: NotCoffee418/docker-compose-deploy-action@v1
-        with:
-          host: ${{ secrets.HOST_IP }}
-          user: caleb
-          key: ${{ secrets.CALEB_GITHUB_PRIVKEY }}
-          repository: git@github.com:CalebTradingBot/Caleb.git
-          deployer_path: /data/caleb/deployer
-          docker_compose_file: docker-compose-prod.yml
-
+    - name: Deploy
+      uses: yourusername/docker-compose-deploy-action@v1
+      with:
+        ssh_host: yourserver.com
+        ssh_user: yourusername
+        ssh_key: ${{ secrets.SSH_PRIVATE_KEY }}
+        ssh_deployer_path: /path/to/deployer/directory
+        repository: yourusername/yourrepository
+        docker_compose_file: docker-compose.yml
 ```
+
+Replace `yourusername`, `yourserver.com`, `yourrepository`, and `/path/to/deployer/directory` with your own values. Also, make sure to have a valid `SSH_PRIVATE_KEY` secret in your repository's secrets.
+
+## Accessing Private Repositories
+
+If you need to deploy a private repository, you can use SSH keys for authentication. Here's how:
+
+1. Generate an SSH key pair on your local machine if you haven't already done so. You can do this by running the command `ssh-keygen` in your terminal.
+
+2. Add the public key to your GitHub account. Go to your GitHub account settings, then click on "SSH and GPG keys" in the left menu. Click the "New SSH key" button, then copy and paste your public key into the "Key" field.
+
+3. Add the private key to your deployment environment. In your deployment environment, create a file called `id_rsa` in the `~/.ssh` directory (or use a different filename if you prefer). Copy the contents of the private key you generated in step 1 into this file.
+
+4. Set the appropriate permissions on the private key file. Run the command `chmod 400 ~/.ssh/id_rsa`.
+
+5. Configure Git to use the SSH key for authentication. Run the command `git config --global core.sshCommand "ssh -i ~/.ssh/id_rsa"`. This tells Git to use your private key for SSH authentication.
+
+After completing these steps, you should be able to deploy private repositories via SSH without needing to log in first. The SSH key will be used for authentication instead.
+
+## Contributing
+
+If you have suggestions for how this GitHub Action could be improved, or want to report a bug, please open an issue or a pull request in this repository. 
+
+## License
+
+This GitHub Action is licensed under the [MIT License](LICENSE).
