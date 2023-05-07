@@ -37,7 +37,7 @@ runs:
       with:
         host: ${{ inputs.ssh_host }}
         user: ${{ inputs.ssh_user }}
-        key: ${{ inputs.key }}
+        key: ${{ inputs.ssh_key }}
         pass: ${{ inputs.ssh_password }}
         command: |
           cd ${{ inputs.ssh_deployer_path }}
