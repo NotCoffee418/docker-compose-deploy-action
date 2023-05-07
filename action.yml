@@ -10,9 +10,11 @@ inputs:
   ssh_key:
     description: 'SSH private key'
     required: false
+    default: ''
   ssh_password:
     description: 'SSH password'
     required: false
+    default: ''
   ssh_deployer_path:
     description: 'Path to the deployer directory on the remote server where the repository will be placed'
     required: true
@@ -36,7 +38,7 @@ runs:
         host: ${{ inputs.ssh_host }}
         user: ${{ inputs.ssh_user }}
         key: ${{ inputs.key }}
-        password: ${{ inputs.ssh_password }}
+        pass: ${{ inputs.ssh_password }}
         command: |
           cd ${{ inputs.ssh_deployer_path }}
           docker compose -f ${{ inputs.docker_compose_file }} down
