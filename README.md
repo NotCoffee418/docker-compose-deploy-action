@@ -18,17 +18,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Deploy
-      uses: yourusername/docker-compose-deploy-action@v1
+      uses: NotCoffee418/docker-compose-deploy-action@v3
       with:
-        ssh_host: yourserver.com
-        ssh_user: yourusername
+        ssh_host: ${{ secrets.SSH_HOST }}
+        ssh_user: ${{ secrets.SSH_USERNAME }}
         ssh_key: ${{ secrets.SSH_PRIVATE_KEY }}
         ssh_deployer_path: /path/to/deployer/directory
         repository: yourusername/yourrepository
         docker_compose_file: docker-compose.yml
 ```
 
-Replace `yourusername`, `yourserver.com`, `yourrepository`, and `/path/to/deployer/directory` with your own values. Also, make sure to have a valid `SSH_PRIVATE_KEY` secret in your repository's secrets.
+Replace `/path/to/deployer/directory` with your own values. Also, make sure to have a valid `SSH_HOST`, `SSH_USERNAME` and `SSH_PRIVATE_KEY` secret in your repository's secrets.
 
 ## Accessing Private Repositories
 
