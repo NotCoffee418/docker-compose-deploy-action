@@ -20,7 +20,7 @@ inputs:
     required: true
   repository:
     description: 'GitHub repository to deploy (e.g., username/repo)'
-    required: true    
+    required: true
   branch:
     description: 'Git branch to checkout (optional, defaults to "main")'
     required: false
@@ -40,6 +40,9 @@ runs:
         key: ${{ inputs.ssh_key }}
         pass: ${{ inputs.ssh_password }}
         command: |
+          if [ ! -d "${{ inputs.ssh_deployer_path }}" ]; then
+            mkdir -p "${{ inputs.ssh_deployer_path }}" || { echo "::error::Failed to create directory ${{ inputs.ssh_deployer_path }}"; exit 1; }
+          fi
           cd ${{ inputs.ssh_deployer_path }}
           docker compose -f ${{ inputs.docker_compose_file }} down
           GIT_SSH_COMMAND='ssh' git clone git@github.com:${{ inputs.repository }}.git . \
