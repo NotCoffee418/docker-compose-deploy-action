@@ -57,12 +57,13 @@ To give your server access to your GitHub repositories using SSH keys, follow th
 3. **Configure Git to Use the SSH Key:**
    - Edit your SSH configuration file (`~/.ssh/config`) to use the new key for GitHub:
     ```bash
-    mkdir -p ~/.ssh
     echo -e "Host github.com\n  IdentityFile ~/.ssh/github-keys/id_rsa\n  User git" >> ~/.ssh/config
+    chmod 600 /home/runner/.ssh/config
     ```
    - Test the connection and approve fingerprint on first time connecting:
     ```bash
     ssh -T git@github.com
+    # yes
     ```
 
 
