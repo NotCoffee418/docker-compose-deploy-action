@@ -23,6 +23,7 @@ jobs:
         ssh_host: ${{ secrets.SSH_HOST }}
         ssh_user: ${{ secrets.SSH_USERNAME }}
         ssh_key: ${{ secrets.SSH_PRIVATE_KEY }}
+        ssh_port: ${{ secrets.SSH_PORT }}
         ssh_deployer_path: /path/to/deployer/directory
         repository: yourusername/yourrepository
         docker_compose_file: docker-compose.yml

@@ -15,6 +15,10 @@ inputs:
     description: 'SSH password'
     required: false
     default: ''
+  ssh_port:
+    description: 'SSH port'
+    required: false
+    default: '22'
   ssh_deployer_path:
     description: 'Path to the deployer directory on the remote server where the repository will be placed'
     required: true
@@ -39,6 +43,7 @@ runs:
         user: ${{ inputs.ssh_user }}
         key: ${{ inputs.ssh_key }}
         pass: ${{ inputs.ssh_password }}
+        port: ${{ inputs.ssh_port }}
         command: |
           if [ ! -d "${{ inputs.ssh_deployer_path }}" ]; then
             mkdir -p "${{ inputs.ssh_deployer_path }}" || { echo "::error::Failed to create directory ${{ inputs.ssh_deployer_path }}"; exit 1; }
