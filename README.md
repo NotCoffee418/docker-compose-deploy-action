@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Deploy
-      uses: notcoffee418/docker-compose-deploy-action@v4
+      uses: notcoffee418/docker-compose-deploy-action@v5
       with:
         ssh_host: ${{ secrets.SSH_HOST }}
         ssh_user: ${{ secrets.SSH_USERNAME }}
