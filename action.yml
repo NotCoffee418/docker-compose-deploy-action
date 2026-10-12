@@ -12,13 +12,20 @@ inputs:
     required: false
     default: ''
   ssh_password:
-    description: 'SSH password'
+    description: 'SSH password (requires sshpass; prefer ssh_key)'
     required: false
     default: ''
   ssh_port:
     description: 'SSH port'
     required: false
     default: '22'
+  ssh_known_hosts:
+    description: >-
+      Known hosts entry/entries for the server (output of `ssh-keyscan -p <port> <host>`
+      run from a trusted network). Strongly recommended: if empty, the host key is
+      fetched at deploy time and cannot protect against a man-in-the-middle.
+    required: false
+    default: ''
   ssh_deployer_path:
     description: 'Path to the deployer directory on the remote server where the repository will be placed'
     required: true
@@ -37,20 +44,128 @@ runs:
   using: 'composite'
   steps:
     - name: Deploy
-      uses: fifsky/ssh-action@v0.0.6
-      with:
-        host: ${{ inputs.ssh_host }}
-        user: ${{ inputs.ssh_user }}
-        key: ${{ inputs.ssh_key }}
-        pass: ${{ inputs.ssh_password }}
-        port: ${{ inputs.ssh_port }}
-        command: |
-          if [ ! -d "${{ inputs.ssh_deployer_path }}" ]; then
-            mkdir -p "${{ inputs.ssh_deployer_path }}" || { echo "::error::Failed to create directory ${{ inputs.ssh_deployer_path }}"; exit 1; }
-          fi
-          cd ${{ inputs.ssh_deployer_path }}
-          docker compose -f ${{ inputs.docker_compose_file }} down
-          GIT_SSH_COMMAND='ssh' git clone git@github.com:${{ inputs.repository }}.git . \
-            2> /dev/null || GIT_SSH_COMMAND='ssh' git -C . pull
-          git checkout ${{ inputs.branch }}
-          docker compose -f ${{ inputs.docker_compose_file }} up --build --force-recreate -d
+      shell: bash
+      # Inputs are passed through the environment and never interpolated into the script,
+      # so their content cannot be interpreted as shell code on the runner.
+      env:
+        INPUT_SSH_HOST: ${{ inputs.ssh_host }}
+        INPUT_SSH_USER: ${{ inputs.ssh_user }}
+        INPUT_SSH_KEY: ${{ inputs.ssh_key }}
+        INPUT_SSH_PASSWORD: ${{ inputs.ssh_password }}
+        INPUT_SSH_PORT: ${{ inputs.ssh_port }}
+        INPUT_SSH_KNOWN_HOSTS: ${{ inputs.ssh_known_hosts }}
+        INPUT_DEPLOYER_PATH: ${{ inputs.ssh_deployer_path }}
+        INPUT_REPOSITORY: ${{ inputs.repository }}
+        INPUT_BRANCH: ${{ inputs.branch }}
+        INPUT_COMPOSE_FILE: ${{ inputs.docker_compose_file }}
+      run: |
+        set -euo pipefail
+
+        fail() { echo "::error::$1"; exit 1; }
+
+        # ---- Defaults for inputs explicitly passed as empty strings (e.g. unset secrets) ----
+        port="${INPUT_SSH_PORT:-22}"
+        branch="${INPUT_BRANCH:-main}"
+        compose_file="${INPUT_COMPOSE_FILE:-docker-compose.yml}"
+
+        # ---- Validate inputs (these end up in ssh/git/docker arguments) ----
+        [[ "$INPUT_SSH_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9.:_-]*[A-Za-z0-9])?$ ]] || fail "Invalid ssh_host"
+        [[ "$INPUT_SSH_USER" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] || fail "Invalid ssh_user"
+        [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || fail "Invalid ssh_port"
+        [[ "$INPUT_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "Invalid repository (expected owner/name)"
+        [[ "$branch" =~ ^[A-Za-z0-9_][A-Za-z0-9._/+@#%=,-]*$ && "$branch" != *@\{* ]] \
+          && git check-ref-format --branch "$branch" >/dev/null 2>&1 || fail "Invalid branch"
+        [[ "$compose_file" =~ ^[A-Za-z0-9_.][A-Za-z0-9._/-]*$ ]] || fail "Invalid docker_compose_file"
+        [[ -n "$INPUT_DEPLOYER_PATH" && "$INPUT_DEPLOYER_PATH" != -* && "$INPUT_DEPLOYER_PATH" != *[[:cntrl:]]* ]] || fail "Invalid ssh_deployer_path"
+        [[ -n "$INPUT_SSH_KEY" || -n "$INPUT_SSH_PASSWORD" ]] || fail "Either ssh_key or ssh_password must be provided"
+
+        # ---- Private workspace for key material, removed on exit ----
+        umask 077
+        tmp="$(mktemp -d)"
+        stop_token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+        # Always resume workflow-command processing and remove key material, even on failure.
+        trap 'echo "::${stop_token}::"; rm -rf "$tmp"' EXIT
+
+        # ---- Host key verification ----
+        if [[ -n "$INPUT_SSH_KNOWN_HOSTS" ]]; then
+          printf '%s\n' "$INPUT_SSH_KNOWN_HOSTS" > "$tmp/known_hosts"
+        else
+          echo "::warning::ssh_known_hosts not set: trusting the host key presented right now (no protection against MITM). Set ssh_known_hosts to pin it."
+          ssh-keyscan -T 10 -p "$port" -- "$INPUT_SSH_HOST" > "$tmp/known_hosts" 2>/dev/null || true
+          [[ -s "$tmp/known_hosts" ]] || fail "Could not retrieve SSH host key from $INPUT_SSH_HOST:$port"
+        fi
+
+        ssh_cmd=(ssh -T
+          -p "$port" -l "$INPUT_SSH_USER"
+          -o StrictHostKeyChecking=yes
+          -o UserKnownHostsFile="$tmp/known_hosts"
+          -o GlobalKnownHostsFile=/dev/null
+          -o ConnectTimeout=30
+          -o ServerAliveInterval=30
+          -o ForwardAgent=no
+          -o ForwardX11=no)
+
+        # Like the previous implementation, a password (if given) takes precedence over the key.
+        if [[ -n "$INPUT_SSH_PASSWORD" ]]; then
+          command -v sshpass >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends sshpass >/dev/null \
+            || fail "ssh_password requires sshpass, which is not installed and could not be installed"
+          # Password goes via a private file: not in argv (ps) and not in the environment.
+          printf '%s' "$INPUT_SSH_PASSWORD" > "$tmp/pw"
+          ssh_cmd=(sshpass -f "$tmp/pw" "${ssh_cmd[@]}" -o PubkeyAuthentication=no)
+        else
+          printf '%s\n' "$INPUT_SSH_KEY" > "$tmp/id"
+          chmod 600 "$tmp/id"
+          ssh_cmd+=(-i "$tmp/id" -o IdentitiesOnly=yes -o BatchMode=yes -o PasswordAuthentication=no)
+        fi
+        # Credentials now live only in the private temp dir; don't hand them to child processes.
+        unset INPUT_SSH_KEY INPUT_SSH_PASSWORD
+
+        # Single-quote a value so any shell treats it as one literal word.
+        shq() { local v=${1//\'/\'\\\'\'}; printf "'%s'" "$v"; }
+
+        # The script is fed to the remote *login* shell on stdin (as before), so the user's
+        # profile/PATH applies. Values are sent as quoted assignments, never spliced into code.
+        # Everything the server prints is untrusted (it includes output of the deployed repo's
+        # Docker build), so stop the runner from interpreting "::command::" lines in it.
+        echo "::stop-commands::${stop_token}"
+        {
+          printf 'deploy_path=%s\nrepository=%s\nbranch=%s\ncompose_file=%s\n' \
+            "$(shq "$INPUT_DEPLOYER_PATH")" "$(shq "$INPUT_REPOSITORY")" "$(shq "$branch")" "$(shq "$compose_file")"
+          cat <<'REMOTE_SCRIPT'
+        set -eu
+
+        case "$deploy_path" in
+          "~")           deploy_path=$HOME ;;
+          "~/"*)         deploy_path=$HOME/${deploy_path#"~/"} ;;
+          '$HOME')       deploy_path=$HOME ;;
+          '$HOME/'*)     deploy_path=$HOME/${deploy_path#'$HOME/'} ;;
+          '${HOME}')     deploy_path=$HOME ;;
+          '${HOME}/'*)   deploy_path=$HOME/${deploy_path#'${HOME}/'} ;;
+        esac
+
+        mkdir -p -- "$deploy_path"
+        cd -- "$deploy_path"
+
+        GIT_TERMINAL_PROMPT=0
+        export GIT_TERMINAL_PROMPT
+        remote_url="git@github.com:${repository}.git"
+        if [ -d .git ]; then
+          git remote set-url origin "$remote_url"
+        else
+          git init -q
+          git remote add origin "$remote_url"
+        fi
+
+        # Fetch first: if this fails the running stack is left untouched.
+        git fetch --prune origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" </dev/null
+
+        # Stop the stack using the *currently checked out* compose file, then update the code.
+        if [ -f "$compose_file" ]; then
+          docker compose -f "$compose_file" down </dev/null \
+            || echo "WARNING: docker compose down failed; continuing with deployment"
+        fi
+
+        git checkout -q -B "$branch" "refs/remotes/origin/${branch}" </dev/null
+        docker compose -f "$compose_file" up --build --force-recreate -d </dev/null
+        REMOTE_SCRIPT
+        } | "${ssh_cmd[@]}" -- "$INPUT_SSH_HOST"
