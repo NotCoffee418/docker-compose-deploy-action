@@ -1,0 +1,255 @@
+name: Integration test
+
+# Runs this action (uses: ./) against a throwaway SSH server that lives on the runner itself.
+# No secrets and no external machines are involved: the host/client keys are generated per run,
+# sshd listens on 127.0.0.1 only, and the runner VM is destroyed afterwards.
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    # ubuntu-latest moves from 24.04 to 26.04 between 2026-10-19 and 2026-11-19; cover both explicitly.
+    name: deploy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    timeout-minutes: 15
+    env:
+      SSH_PORT: "2222"
+      COMPOSE_FILE_PATH: test/fixture/docker-compose.yml
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # ---------------------------------------------------------------- test server
+      - name: Start a local SSH server
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/sshd"
+          mkdir -p "$d"
+          me="$(id -un)"
+
+          ssh-keygen -q -t ed25519 -N '' -f "$d/host_key"
+          ssh-keygen -q -t ed25519 -N '' -f "$d/host_key_other"   # a key the server does NOT have
+          ssh-keygen -q -t ed25519 -N '' -f "$d/client_key"
+          # Not a GitHub secret, but step headers print `with:`/`env:` values: mask it line by line
+          # so it never shows up in the (public) log.
+          grep -v '^-----' "$d/client_key" | while IFS= read -r line; do echo "::add-mask::$line"; done
+
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          cat "$d/client_key.pub" >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+
+          # Throwaway password for the password-auth test (masked, never reused).
+          pw="$(openssl rand -hex 16)"
+          echo "::add-mask::$pw"
+          echo "$me:$pw" | sudo chpasswd
+
+          # known_hosts lines built out-of-band from the public host keys (a real pin).
+          echo "[127.0.0.1]:$SSH_PORT $(cut -d' ' -f1,2 "$d/host_key.pub")"       > "$d/known_hosts_good"
+          echo "[127.0.0.1]:$SSH_PORT $(cut -d' ' -f1,2 "$d/host_key_other.pub")"  > "$d/known_hosts_bad"
+
+          {
+            echo "TEST_USER=$me"
+            echo "TEST_PASSWORD=$pw"
+            echo "TEST_KNOWN_HOSTS_GOOD=$(cat "$d/known_hosts_good")"
+            echo "TEST_KNOWN_HOSTS_BAD=$(cat "$d/known_hosts_bad")"
+            echo "TEST_SSH_KEY<<EOF_TEST_KEY"
+            cat "$d/client_key"
+            echo "EOF_TEST_KEY"
+          } >> "$GITHUB_ENV"
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends openssh-server
+          sudo chown root:root "$d/host_key"
+          # A fresh ssh login gets its groups from /etc/group; make sure docker is among them.
+          sudo usermod -aG docker "$me"
+
+          cat > "$d/sshd_config" <<EOF
+          Port $SSH_PORT
+          ListenAddress 127.0.0.1
+          HostKey $d/host_key
+          PidFile $d/sshd.pid
+          AllowUsers $me
+          PubkeyAuthentication yes
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication no
+          UsePAM yes
+          StrictModes no
+          EOF
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd -f "$d/sshd_config" -E "$d/sshd.log"
+
+          # "Server side" git has no GitHub deploy key; this repo is public, so fetch over https.
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: Sanity-check the test server (key login, docker on login PATH)
+        run: |
+          set -euo pipefail
+          install -m 600 /dev/null "$RUNNER_TEMP/k"
+          printf '%s\n' "$TEST_SSH_KEY" > "$RUNNER_TEMP/k"
+          ssh -p "$SSH_PORT" -i "$RUNNER_TEMP/k" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/sshd/known_hosts_good" \
+            "$TEST_USER@127.0.0.1" 'docker compose version && git --version' \
+            || { sudo cat "$RUNNER_TEMP/sshd/sshd.log" || true; exit 1; }
+          rm -f "$RUNNER_TEMP/k"
+
+      # ------------------------------------------------- 1: fresh deploy, key + pinned host key
+      - name: Deploy (key auth, pinned host key, path with a space, first run)
+        uses: ./
+        with:
+          ssh_host: 127.0.0.1
+          ssh_user: ${{ env.TEST_USER }}
+          ssh_key: ${{ env.TEST_SSH_KEY }}
+          ssh_port: ${{ env.SSH_PORT }}
+          ssh_known_hosts: ${{ env.TEST_KNOWN_HOSTS_GOOD }}
+          ssh_deployer_path: $HOME/deploy dir
+          repository: ${{ github.repository }}
+          branch: ${{ github.ref_name }}
+          docker_compose_file: ${{ env.COMPOSE_FILE_PATH }}
+
+      - name: Assert first deploy
+        run: bash test/assert-deployed.sh "$HOME/deploy dir" "$GITHUB_SHA" "$COMPOSE_FILE_PATH" "$RUNNER_TEMP/cid1"
+
+      # --------------------------- 2: redeploy over an existing checkout, password auth, unpinned host
+      # The runner images ship sshpass; remove it so the action's own install path is exercised.
+      - name: Uninstall sshpass
+        run: |
+          sudo apt-get remove -y -qq sshpass
+          ! command -v sshpass
+
+      - name: Redeploy (password auth, no pinned host key)
+        uses: ./
+        with:
+          ssh_host: 127.0.0.1
+          ssh_user: ${{ env.TEST_USER }}
+          ssh_password: ${{ env.TEST_PASSWORD }}
+          ssh_port: ${{ env.SSH_PORT }}
+          ssh_deployer_path: ~/deploy dir
+          repository: ${{ github.repository }}
+          branch: ${{ github.ref_name }}
+          docker_compose_file: ${{ env.COMPOSE_FILE_PATH }}
+
+      - name: Assert redeploy recreated the container
+        run: |
+          set -euo pipefail
+          bash test/assert-deployed.sh "$HOME/deploy dir" "$GITHUB_SHA" "$COMPOSE_FILE_PATH" "$RUNNER_TEMP/cid2"
+          if cmp -s "$RUNNER_TEMP/cid1" "$RUNNER_TEMP/cid2"; then
+            echo "::error::container was not recreated on redeploy"; exit 1
+          fi
+
+      # ------------------------------------------------------------------ 3: must-fail cases
+      - name: "Must fail: shell metacharacters in branch"
+        id: bad_branch
+        continue-on-error: true
+        uses: ./
+        with:
+          ssh_host: 127.0.0.1
+          ssh_user: ${{ env.TEST_USER }}
+          ssh_key: ${{ env.TEST_SSH_KEY }}
+          ssh_port: ${{ env.SSH_PORT }}
+          ssh_known_hosts: ${{ env.TEST_KNOWN_HOSTS_GOOD }}
+          ssh_deployer_path: $HOME/deploy dir
+          repository: ${{ github.repository }}
+          branch: "main; touch ${{ runner.temp }}/pwned-branch"
+          docker_compose_file: ${{ env.COMPOSE_FILE_PATH }}
+
+      - name: "Must fail: ssh option injection via host"
+        id: bad_host
+        continue-on-error: true
+        uses: ./
+        with:
+          ssh_host: "127.0.0.1 -oProxyCommand=touch${{ runner.temp }}/pwned-host"
+          ssh_user: ${{ env.TEST_USER }}
+          ssh_key: ${{ env.TEST_SSH_KEY }}
+          ssh_port: ${{ env.SSH_PORT }}
+          ssh_known_hosts: ${{ env.TEST_KNOWN_HOSTS_GOOD }}
+          ssh_deployer_path: $HOME/deploy dir
+          repository: ${{ github.repository }}
+          branch: ${{ github.ref_name }}
+          docker_compose_file: ${{ env.COMPOSE_FILE_PATH }}
+
+      - name: "Must fail: pinned host key does not match the server"
+        id: bad_hostkey
+        continue-on-error: true
+        uses: ./
+        with:
+          ssh_host: 127.0.0.1
+          ssh_user: ${{ env.TEST_USER }}
+          ssh_key: ${{ env.TEST_SSH_KEY }}
+          ssh_port: ${{ env.SSH_PORT }}
+          ssh_known_hosts: ${{ env.TEST_KNOWN_HOSTS_BAD }}
+          ssh_deployer_path: $HOME/deploy dir
+          repository: ${{ github.repository }}
+          branch: ${{ github.ref_name }}
+          docker_compose_file: ${{ env.COMPOSE_FILE_PATH }}
+
+      # Passes input validation, so it reaches the server. The branch doesn't exist, so the run
+      # fails at `git fetch` -- but only after the deploy path has been quoted and used.
+      - name: "Must fail: quote/semicolon in deploy path is data, not code"
+        id: evil_path
+        continue-on-error: true
+        uses: ./
+        with:
+          ssh_host: 127.0.0.1
+          ssh_user: ${{ env.TEST_USER }}
+          ssh_key: ${{ env.TEST_SSH_KEY }}
+          ssh_port: ${{ env.SSH_PORT }}
+          ssh_known_hosts: ${{ env.TEST_KNOWN_HOSTS_GOOD }}
+          ssh_deployer_path: "$HOME/q'; touch ${{ runner.temp }}/pwned-path; echo '"
+          repository: ${{ github.repository }}
+          branch: no-such-branch-for-this-test
+          docker_compose_file: ${{ env.COMPOSE_FILE_PATH }}
+
+      - name: Assert the must-fail cases failed for the right reasons
+        run: |
+          set -euo pipefail
+          ok=true
+          expect_failure() {
+            if [[ "$2" != "failure" ]]; then echo "::error::'$1' should have failed but outcome was '$2'"; ok=false; fi
+          }
+          expect_failure "bad branch"  "${{ steps.bad_branch.outcome }}"
+          expect_failure "bad host"    "${{ steps.bad_host.outcome }}"
+          expect_failure "bad hostkey" "${{ steps.bad_hostkey.outcome }}"
+          expect_failure "evil path"   "${{ steps.evil_path.outcome }}"
+
+          for canary in pwned-branch pwned-host pwned-path; do
+            if [[ -e "$RUNNER_TEMP/$canary" ]]; then echo "::error::injection succeeded: $canary exists"; ok=false; fi
+          done
+
+          # The evil path must have been created as a literal directory name, proving the
+          # run got far enough (SSH connected, script ran) for the quoting to matter.
+          evil="$HOME/q'; touch $RUNNER_TEMP/pwned-path; echo '"
+          if [[ ! -d "$evil" ]]; then echo "::error::evil-path test never reached the server"; ok=false; fi
+
+          # Failed runs must not have disturbed the healthy deployment.
+          bash test/assert-deployed.sh "$HOME/deploy dir" "$GITHUB_SHA" "$COMPOSE_FILE_PATH" "$RUNNER_TEMP/cid3"
+          cmp -s "$RUNNER_TEMP/cid2" "$RUNNER_TEMP/cid3" || { echo "::error::failed runs disturbed the running stack"; ok=false; }
+
+          $ok
+
+      # ------------------------------------------------------------------------------ cleanup
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          sudo cat "$RUNNER_TEMP/sshd/sshd.log" || true
+          docker ps -a || true
+          ls -la "$HOME" || true
+
+      - name: Tear down
+        if: always()
+        run: |
+          (cd "$HOME/deploy dir" 2>/dev/null && docker compose -f "$COMPOSE_FILE_PATH" down -v) || true
+          sudo kill "$(cat "$RUNNER_TEMP/sshd/sshd.pid" 2>/dev/null)" 2>/dev/null || true

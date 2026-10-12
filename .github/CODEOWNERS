@@ -1,0 +1,4 @@
+# Anything that decides what runs on a server (or on CI) needs the owner's review.
+/.github/            @NotCoffee418
+/action.yml          @NotCoffee418
+/test/               @NotCoffee418
